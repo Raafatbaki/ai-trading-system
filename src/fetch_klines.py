@@ -1,41 +1,83 @@
+import argparse
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import time
 
 import pandas as pd
 import requests
 
 BASE_URL = "https://api.bybit.com"
-
-# Market configuration
-SYMBOL = "BTCUSDT"
 CATEGORY = "spot"
-INTERVAL = "15"
 
-# Historical data configuration
+SUPPORTED_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+]
+
+TIMEFRAMES = {
+    "15m": {
+        "bybit_interval": "15",
+        "pandas_frequency": "15min",
+    },
+    "1h": {
+        "bybit_interval": "60",
+        "pandas_frequency": "1h",
+    },
+    "4h": {
+        "bybit_interval": "240",
+        "pandas_frequency": "4h",
+    },
+}
+
 LIMIT = 1000
-DAYS_TO_DOWNLOAD = 365
+DEFAULT_DAYS = 365
 
-# API protection
 REQUEST_DELAY_SECONDS = 0.7
 MAX_RETRIES = 6
 
-# Output
-OUTPUT_FILE = Path("data/BTCUSDT_spot_15m.csv")
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Download historical Bybit Spot candles."
+    )
+
+    parser.add_argument(
+        "--symbol",
+        choices=SUPPORTED_SYMBOLS,
+        default="BTCUSDT",
+        help="Trading pair.",
+    )
+
+    parser.add_argument(
+        "--timeframe",
+        choices=TIMEFRAMES.keys(),
+        default="1h",
+        help="Candle timeframe.",
+    )
+
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAYS,
+        help="Number of historical days.",
+    )
+
+    return parser.parse_args()
 
 
-def fetch_batch(end_time_ms: int) -> list:
-    """
-    Fetch one batch of historical Spot candles from Bybit.
-    Retries automatically when the API rate limit is reached.
-    """
+def fetch_batch(
+    symbol: str,
+    interval: str,
+    end_time_ms: int,
+) -> list:
 
     url = f"{BASE_URL}/v5/market/kline"
 
     params = {
         "category": CATEGORY,
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
+        "symbol": symbol,
+        "interval": interval,
         "limit": LIMIT,
         "end": end_time_ms,
     }
@@ -51,7 +93,7 @@ def fetch_batch(end_time_ms: int) -> list:
             if response.status_code == 429:
                 wait_seconds = 2**attempt
 
-                print(f"HTTP rate limit reached. " f"Waiting {wait_seconds} seconds...")
+                print(f"HTTP rate limit. " f"Waiting {wait_seconds}s...")
 
                 time.sleep(wait_seconds)
                 continue
@@ -69,45 +111,56 @@ def fetch_batch(end_time_ms: int) -> list:
             if "rate limit" in ret_msg.lower() or "too many visits" in ret_msg.lower():
                 wait_seconds = 2**attempt
 
-                print(
-                    f"Bybit rate limit reached. " f"Waiting {wait_seconds} seconds..."
-                )
+                print(f"Bybit rate limit. " f"Waiting {wait_seconds}s...")
 
                 time.sleep(wait_seconds)
                 continue
 
-            raise RuntimeError(f"Bybit API error " f"(retCode={ret_code}): {ret_msg}")
+            raise RuntimeError(
+                f"Bybit API error " f"(retCode={ret_code}): " f"{ret_msg}"
+            )
 
         except requests.RequestException as error:
             if attempt == MAX_RETRIES - 1:
-                raise RuntimeError(
-                    f"Network error while contacting Bybit: {error}"
-                ) from error
+                raise RuntimeError(f"Network error: {error}") from error
 
             wait_seconds = 2**attempt
 
-            print(f"Network error. " f"Waiting {wait_seconds} seconds before retry...")
+            print(f"Network error. " f"Waiting {wait_seconds}s...")
 
             time.sleep(wait_seconds)
 
-    raise RuntimeError("Bybit API failed after maximum retry attempts.")
+    raise RuntimeError("Bybit API failed after maximum retries.")
 
 
-def fetch_historical_klines() -> pd.DataFrame:
-    """
-    Download historical Spot candles for the configured period.
-    """
+def fetch_historical_klines(
+    symbol: str,
+    timeframe: str,
+    days: int,
+) -> pd.DataFrame:
+
+    config = TIMEFRAMES[timeframe]
+
+    interval = config["bybit_interval"]
+
+    pandas_frequency = config["pandas_frequency"]
 
     end_date = datetime.now(timezone.utc)
-    start_date = end_date - timedelta(days=DAYS_TO_DOWNLOAD)
+
+    start_date = end_date - timedelta(days=days)
 
     start_time_ms = int(start_date.timestamp() * 1000)
+
     current_end_ms = int(end_date.timestamp() * 1000)
 
     all_rows = []
 
     while True:
-        rows = fetch_batch(current_end_ms)
+        rows = fetch_batch(
+            symbol=symbol,
+            interval=interval,
+            end_time_ms=current_end_ms,
+        )
 
         if not rows:
             break
@@ -122,7 +175,9 @@ def fetch_historical_klines() -> pd.DataFrame:
             utc=True,
         )
 
-        print(f"Downloaded: {len(all_rows)} candles | " f"Oldest: {oldest_datetime}")
+        print(
+            f"Downloaded: " f"{len(all_rows)} candles | " f"Oldest: {oldest_datetime}"
+        )
 
         if oldest_timestamp <= start_time_ms:
             break
@@ -132,7 +187,7 @@ def fetch_historical_klines() -> pd.DataFrame:
         time.sleep(REQUEST_DELAY_SECONDS)
 
     if not all_rows:
-        raise RuntimeError("No candle data was returned by Bybit.")
+        raise RuntimeError(f"No data returned for " f"{symbol}.")
 
     dataframe = pd.DataFrame(
         all_rows,
@@ -164,19 +219,18 @@ def fetch_historical_klines() -> pd.DataFrame:
 
     dataframe[numeric_columns] = dataframe[numeric_columns].astype(float)
 
-    # Keep only the requested time period.
     dataframe = dataframe[dataframe["timestamp"] >= start_date]
 
-    # Remove duplicates and sort chronologically.
     dataframe = (
         dataframe.drop_duplicates(subset="timestamp")
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
 
-    # Remove the currently open/incomplete 15-minute candle.
+    # Remove currently open candle.
     now = pd.Timestamp.now(tz="UTC")
-    current_candle_start = now.floor("15min")
+
+    current_candle_start = now.floor(pandas_frequency)
 
     dataframe = dataframe[dataframe["timestamp"] < current_candle_start].reset_index(
         drop=True
@@ -185,33 +239,49 @@ def fetch_historical_klines() -> pd.DataFrame:
     return dataframe
 
 
-def main() -> None:
-    print("Market data configuration:")
-    print(f"Symbol:     {SYMBOL}")
-    print(f"Market:     {CATEGORY.upper()}")
-    print(f"Timeframe:  {INTERVAL}m")
-    print(f"History:    {DAYS_TO_DOWNLOAD} days")
+def main():
+    args = parse_arguments()
+
+    symbol = args.symbol
+    timeframe = args.timeframe
+    days = args.days
+
+    output_file = Path(f"data/" f"{symbol}_{CATEGORY}_" f"{timeframe}.csv")
+
+    print()
+    print("=" * 60)
+    print("MARKET DATA DOWNLOAD")
+    print("=" * 60)
+
+    print()
+    print(f"Symbol:    {symbol}")
+    print(f"Market:    {CATEGORY.upper()}")
+    print(f"Timeframe: {timeframe}")
+    print(f"History:   {days} days")
     print()
 
-    dataframe = fetch_historical_klines()
+    dataframe = fetch_historical_klines(
+        symbol=symbol,
+        timeframe=timeframe,
+        days=days,
+    )
 
-    OUTPUT_FILE.parent.mkdir(
+    output_file.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     dataframe.to_csv(
-        OUTPUT_FILE,
+        output_file,
         index=False,
     )
 
     print()
     print("Download completed.")
-    print(f"Market:  {CATEGORY.upper()}")
     print(f"Candles: {len(dataframe)}")
-    print(f"From:    {dataframe['timestamp'].min()}")
-    print(f"To:      {dataframe['timestamp'].max()}")
-    print(f"Saved to: {OUTPUT_FILE}")
+    print(f"From:    " f"{dataframe['timestamp'].min()}")
+    print(f"To:      " f"{dataframe['timestamp'].max()}")
+    print(f"Saved to: {output_file}")
 
 
 if __name__ == "__main__":

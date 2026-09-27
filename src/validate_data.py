@@ -1,82 +1,144 @@
+import argparse
 from pathlib import Path
 
 import pandas as pd
 
-DATA_FILE = Path("data/BTCUSDT_spot_15m.csv")
-EXPECTED_INTERVAL = pd.Timedelta(minutes=15)
+MARKET = "spot"
+
+SUPPORTED_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+]
+
+TIMEFRAMES = {
+    "15m": pd.Timedelta(minutes=15),
+    "1h": pd.Timedelta(hours=1),
+    "4h": pd.Timedelta(hours=4),
+}
 
 
-def main():
-    df = pd.read_csv(DATA_FILE, parse_dates=["timestamp"])
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Validate historical market data.")
 
-    print(f"Candles: {len(df)}")
-    print(f"From:    {df['timestamp'].min()}")
-    print(f"To:      {df['timestamp'].max()}")
-    print()
+    parser.add_argument(
+        "--symbol",
+        choices=SUPPORTED_SYMBOLS,
+        default="BTCUSDT",
+    )
 
-    # 1. Duplicate timestamps
-    duplicates = df["timestamp"].duplicated().sum()
-    print(f"Duplicate timestamps: {duplicates}")
+    parser.add_argument(
+        "--timeframe",
+        choices=TIMEFRAMES.keys(),
+        default="1h",
+    )
 
-    # 2. Missing values
-    missing_values = df.isna().sum().sum()
-    print(f"Missing values:       {missing_values}")
+    return parser.parse_args()
 
-    # 3. Check chronological order
-    sorted_correctly = df["timestamp"].is_monotonic_increasing
-    print(f"Chronological order:  {sorted_correctly}")
 
-    # 4. Check gaps
-    time_diff = df["timestamp"].diff()
-    gaps = df[time_diff.notna() & (time_diff != EXPECTED_INTERVAL)]
+def validate_data(
+    data_file: Path,
+    expected_interval: pd.Timedelta,
+) -> bool:
 
-    print(f"Time gaps:            {len(gaps)}")
+    dataframe = pd.read_csv(
+        data_file,
+        parse_dates=["timestamp"],
+    )
 
-    if not gaps.empty:
-        print("\nFirst gaps:")
-        for index in gaps.index[:10]:
-            print(
-                df.loc[index - 1, "timestamp"],
-                "→",
-                df.loc[index, "timestamp"],
-            )
+    duplicate_timestamps = dataframe["timestamp"].duplicated().sum()
 
-    # 5. Invalid prices
-    invalid_prices = df[
-        (df["open"] <= 0) | (df["high"] <= 0) | (df["low"] <= 0) | (df["close"] <= 0)
+    missing_values = dataframe.isna().sum().sum()
+
+    chronological_order = dataframe["timestamp"].is_monotonic_increasing
+
+    time_differences = dataframe["timestamp"].diff()
+
+    gaps = dataframe[time_differences.notna() & (time_differences != expected_interval)]
+
+    invalid_prices = dataframe[
+        (dataframe["open"] <= 0)
+        | (dataframe["high"] <= 0)
+        | (dataframe["low"] <= 0)
+        | (dataframe["close"] <= 0)
     ]
 
-    print(f"Invalid prices:       {len(invalid_prices)}")
-
-    # 6. OHLC consistency
-    invalid_ohlc = df[
-        (df["high"] < df["low"])
-        | (df["high"] < df["open"])
-        | (df["high"] < df["close"])
-        | (df["low"] > df["open"])
-        | (df["low"] > df["close"])
+    invalid_ohlc = dataframe[
+        (dataframe["high"] < dataframe["low"])
+        | (dataframe["high"] < dataframe["open"])
+        | (dataframe["high"] < dataframe["close"])
+        | (dataframe["low"] > dataframe["open"])
+        | (dataframe["low"] > dataframe["close"])
     ]
 
-    print(f"Invalid OHLC candles: {len(invalid_ohlc)}")
-
-    # 7. Negative volume
-    invalid_volume = df[df["volume"] < 0]
-    print(f"Invalid volume:       {len(invalid_volume)}")
+    invalid_volume = dataframe[dataframe["volume"] < 0]
 
     print()
+    print("=" * 60)
+    print("MARKET DATA VALIDATION")
+    print("=" * 60)
 
-    if (
-        duplicates == 0
+    print()
+    print(f"File:                  {data_file}")
+    print(f"Candles:               {len(dataframe)}")
+    print(f"From:                  {dataframe['timestamp'].min()}")
+    print(f"To:                    {dataframe['timestamp'].max()}")
+
+    print()
+    print(f"Duplicate timestamps:  {duplicate_timestamps}")
+    print(f"Missing values:        {missing_values}")
+    print(f"Chronological order:   {chronological_order}")
+    print(f"Time gaps:             {len(gaps)}")
+    print(f"Invalid prices:        {len(invalid_prices)}")
+    print(f"Invalid OHLC candles:  {len(invalid_ohlc)}")
+    print(f"Invalid volume:        {len(invalid_volume)}")
+
+    passed = (
+        duplicate_timestamps == 0
         and missing_values == 0
-        and sorted_correctly
+        and chronological_order
         and len(gaps) == 0
         and len(invalid_prices) == 0
         and len(invalid_ohlc) == 0
         and len(invalid_volume) == 0
-    ):
+    )
+
+    print()
+
+    if passed:
         print("✅ Data validation PASSED")
     else:
         print("❌ Data validation FAILED")
+
+        if not gaps.empty:
+            print()
+            print("First gaps:")
+
+            for index in gaps.index[:10]:
+                print(
+                    dataframe.loc[index - 1, "timestamp"],
+                    "→",
+                    dataframe.loc[index, "timestamp"],
+                )
+
+    return passed
+
+
+def main():
+    args = parse_arguments()
+
+    symbol = args.symbol
+    timeframe = args.timeframe
+
+    data_file = Path(f"data/{symbol}_{MARKET}_{timeframe}.csv")
+
+    if not data_file.exists():
+        raise FileNotFoundError(f"Data file not found: {data_file}")
+
+    validate_data(
+        data_file=data_file,
+        expected_interval=TIMEFRAMES[timeframe],
+    )
 
 
 if __name__ == "__main__":
